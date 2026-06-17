@@ -1,27 +1,15 @@
 """
-PDF Studio — Q&A + Summarize + Edit
------------------------------------
-Upload a PDF, then:
-  • Chat / ask questions about it
-  • Summarize it (short / detailed / bullets)
-  • Edit it — add, change, delete or modify text manually OR by telling the
-    AI what to change in plain English — then download the final edited PDF.
-
-Stack (all free):
-  Streamlit (UI) + LangChain (logic) + Groq (LLM) + HuggingFace (local embeddings)
-  + reportlab (rebuilds the edited PDF)
-
-Run it with:   streamlit run app.py
+PDF Studio — Ask · Summarize · Edit · Export
+Free stack: Streamlit (UI) + LangChain (logic) + Groq (free LLM) + HuggingFace (free local embeddings)
+Run locally with:   streamlit run app.py
 """
 
+import io
 import os
 import tempfile
-from io import BytesIO
-from xml.sax.saxutils import escape
-
 import streamlit as st
+from docx import Document as DocxDocument
 
-from pypdf import PdfReader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -31,185 +19,83 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-# reportlab — used to rebuild a real PDF from the edited text
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
-# Optional Arabic shaping (only used if the libs are installed) -----------------
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    _ARABIC_OK = True
-except Exception:
-    _ARABIC_OK = False
-
-
-# =============================================================================
-#  PAGE CONFIG + ANIMATED UI (custom CSS)
-# =============================================================================
+# ======================= PAGE + THEME =======================
 st.set_page_config(page_title="PDF Studio", page_icon="📄", layout="wide")
 
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Inter:wght@400;500&display=swap');
 
-    /* --- Background --- */
-    .stApp {
-        background:
-            radial-gradient(1200px 600px at 10% -10%, rgba(201,162,77,0.10), transparent 60%),
-            radial-gradient(1000px 500px at 110% 10%, rgba(201,162,77,0.06), transparent 55%),
-            #0b0b0d;
-        color: #e9e6df;
-    }
+.stApp{
+  background: radial-gradient(1200px 600px at 20% -10%, #1c1c22 0%, #0d0d0f 55%);
+  color:#ececec; font-family:'Inter',sans-serif;
+}
+.hero-title{
+  font-family:'Cormorant Garamond',serif; font-size:3.2rem; font-weight:700; text-align:center;
+  background:linear-gradient(90deg,#d4af37,#f7e7a6,#d4af37,#bfa14a);
+  background-size:300% 100%; -webkit-background-clip:text; background-clip:text;
+  -webkit-text-fill-color:transparent; animation:shimmer 6s ease infinite; margin-bottom:0;
+}
+@keyframes shimmer{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+.hero-sub{text-align:center; color:#b9b9b9; margin-top:.2rem; letter-spacing:1px; font-size:1rem;}
+.block-container{ animation:fadeIn .8s ease both; }
+@keyframes fadeIn{from{opacity:0; transform:translateY(10px)} to{opacity:1; transform:none}}
 
-    /* --- Animated gradient title --- */
-    .hero-title {
-        font-family: 'Cormorant Garamond', serif;
-        font-weight: 700;
-        font-size: 3.2rem;
-        line-height: 1.05;
-        background: linear-gradient(90deg,#c9a24d,#f7e7b0,#c9a24d,#f7e7b0);
-        background-size: 300% auto;
-        -webkit-background-clip: text;
-        background-clip: text;
-        -webkit-text-fill-color: transparent;
-        animation: shimmer 6s linear infinite;
-        margin-bottom: .2rem;
-    }
-    @keyframes shimmer { to { background-position: 300% center; } }
+.stButton>button, .stDownloadButton>button{
+  background:linear-gradient(135deg,#d4af37,#b8941f); color:#0d0d0f; border:none;
+  border-radius:10px; font-weight:600; padding:.55rem 1.1rem; transition:all .25s ease;
+}
+.stButton>button:hover, .stDownloadButton>button:hover{
+  transform:translateY(-2px); box-shadow:0 6px 22px rgba(212,175,55,.45); filter:brightness(1.05);
+}
+.stTabs [data-baseweb="tab"]{ background:#16161b; border-radius:8px 8px 0 0; color:#c9c9c9; padding:8px 18px; }
+.stTabs [aria-selected="true"]{ background:#23231c; color:#d4af37; }
+</style>
+""", unsafe_allow_html=True)
 
-    .hero-sub {
-        font-family: 'Inter', sans-serif;
-        color: #b7b1a3;
-        font-size: 1rem;
-        letter-spacing: .3px;
-        margin-bottom: 1.2rem;
-    }
-
-    /* --- Fade-in for content blocks --- */
-    .block-container { animation: fadeUp .7s ease both; }
-    @keyframes fadeUp { from {opacity:0; transform: translateY(14px);} to {opacity:1; transform:none;} }
-
-    /* --- Buttons --- */
-    .stButton > button, .stDownloadButton > button {
-        background: linear-gradient(135deg,#c9a24d,#a6802f);
-        color: #14110a;
-        border: none;
-        border-radius: 12px;
-        font-weight: 600;
-        padding: .55rem 1.1rem;
-        transition: transform .15s ease, box-shadow .2s ease, filter .2s ease;
-        box-shadow: 0 6px 18px rgba(201,162,77,.18);
-    }
-    .stButton > button:hover, .stDownloadButton > button:hover {
-        transform: translateY(-2px);
-        filter: brightness(1.07);
-        box-shadow: 0 10px 26px rgba(201,162,77,.30);
-    }
-
-    /* --- Tabs --- */
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(201,162,77,0.18);
-        border-radius: 10px 10px 0 0;
-        padding: 8px 18px;
-        font-family: 'Inter', sans-serif;
-    }
-    .stTabs [aria-selected="true"] {
-        background: rgba(201,162,77,0.14);
-        border-bottom: 2px solid #c9a24d;
-        color: #f7e7b0;
-    }
-
-    /* --- Inputs / text areas --- */
-    textarea, input, .stTextInput input {
-        background: rgba(255,255,255,0.04) !important;
-        color: #f1ede3 !important;
-        border-radius: 10px !important;
-        border: 1px solid rgba(201,162,77,0.20) !important;
-    }
-
-    /* --- Sidebar --- */
-    [data-testid="stSidebar"] {
-        background: #0e0e11;
-        border-right: 1px solid rgba(201,162,77,0.15);
-    }
-
-    /* --- Chat bubbles glow --- */
-    [data-testid="stChatMessage"] {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(201,162,77,0.12);
-        border-radius: 14px;
-        animation: fadeUp .4s ease both;
-    }
-    </style>
-
-    <div class="hero-title">📄 PDF Studio</div>
-    <div class="hero-sub">Ask • Summarize • Edit — and download your changed PDF. Free stack: Groq + LangChain.</div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="hero-title">PDF Studio</div>'
+            '<div class="hero-sub">ASK · SUMMARIZE · EDIT · EXPORT</div>', unsafe_allow_html=True)
+st.write("")
 
 
-# =============================================================================
-#  SIDEBAR: API KEY + UPLOAD
-# =============================================================================
-st.sidebar.header("⚙️ Setup")
+# ======================= SIDEBAR =======================
+st.sidebar.header("Setup")
 groq_api_key = st.sidebar.text_input(
-    "1. Groq API Key",
-    type="password",
+    "1. Groq API Key", type="password",
     value=os.environ.get("GROQ_API_KEY", ""),
-    help="Get a free key at console.groq.com → API Keys",
+    help="Free key from console.groq.com -> API Keys",
 )
 st.sidebar.markdown("---")
 st.sidebar.subheader("2. Upload your PDF")
 uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "💡 Manual editing + PDF download work **without** a key. "
-    "The key is only needed for AI chat, summaries and AI-assisted edits."
-)
+key = groq_api_key
 
 
-# =============================================================================
-#  CACHED EMBEDDING MODEL
-# =============================================================================
+# ======================= HELPERS (THE BACKEND) =======================
 @st.cache_resource(show_spinner=False)
 def load_embeddings():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
-# =============================================================================
-#  LLM HELPER
-# =============================================================================
-def get_llm(api_key, temperature=0):
-    # if this model name ever errors, check console.groq.com for the current one
-    return ChatGroq(model="llama-3.3-70b-versatile", temperature=temperature, api_key=api_key)
+def make_llm(api_key):
+    # if "llama-3.3-70b-versatile" ever errors, check console.groq.com for the current model name
+    return ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=api_key)
 
 
-# =============================================================================
-#  PDF -> SEARCHABLE INDEX (for Q&A)
-# =============================================================================
 def build_vectorstore(file):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file.getvalue())
         tmp_path = tmp.name
-
     documents = PyPDFLoader(tmp_path).load()
+    full_text = "\n\n".join(d.page_content for d in documents)
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(documents)
     vectorstore = FAISS.from_documents(chunks, load_embeddings())
-    return vectorstore, len(documents), len(chunks)
+    return vectorstore, full_text, len(documents), len(chunks)
 
 
 def build_chain(vectorstore, api_key):
-    llm = get_llm(api_key)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     prompt = ChatPromptTemplate.from_template(
         """Answer the question using only the context below.
@@ -222,343 +108,133 @@ Question: {question}
 
 Answer:"""
     )
-
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
-
-    chain = (
+    return (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+        | prompt | make_llm(api_key) | StrOutputParser()
     )
-    return chain
 
 
-# =============================================================================
-#  RAW TEXT EXTRACTION (per page, for the editor)
-# =============================================================================
-def extract_pages(file_bytes):
-    reader = PdfReader(BytesIO(file_bytes))
-    pages = []
-    for pg in reader.pages:
-        try:
-            pages.append(pg.extract_text() or "")
-        except Exception:
-            pages.append("")
-    return pages
-
-
-# =============================================================================
-#  SUMMARIZE
-# =============================================================================
-def summarize_text(full_text, style, api_key):
-    llm = get_llm(api_key)
-    styles = {
-        "Short (TL;DR)": "Write a concise 3–4 sentence summary capturing the core message.",
-        "Detailed": "Write a thorough, well-structured summary in clear paragraphs, covering all key points.",
-        "Bullet points": "Summarize the document as clean, organized bullet points grouped by topic.",
-    }
-    instruction = styles.get(style, styles["Detailed"])
-
-    max_chars = 90000  # llama-3.3-70b has a large context window; stuff if it fits
-    if len(full_text) <= max_chars:
-        return llm.invoke(f"{instruction}\n\nDocument:\n{full_text}\n\nSummary:").content
-
-    # Map-reduce for very long documents
-    splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=200)
-    chunks = splitter.split_text(full_text)
-    partials = []
-    for i, c in enumerate(chunks):
-        partials.append(
-            llm.invoke(f"Summarize part {i+1} of {len(chunks)} of a document:\n\n{c}").content
-        )
+def summarize_text(text, llm):
+    # For long PDFs, summarize section by section, then combine (map-reduce)
+    blocks = [text[i:i + 6000] for i in range(0, len(text), 6000)]
+    if len(blocks) == 1:
+        return llm.invoke("Write a clear, structured summary of this document:\n\n" + text).content
+    partials = [llm.invoke("Summarize this section:\n\n" + b).content for b in blocks]
     combined = "\n\n".join(partials)
-    return llm.invoke(
-        f"{instruction}\n\nCombine these partial summaries into one cohesive result:\n\n{combined}\n\nSummary:"
-    ).content
+    return llm.invoke("Combine these section summaries into one clear overall summary:\n\n" + combined).content
 
 
-# =============================================================================
-#  AI-ASSISTED EDIT
-# =============================================================================
-def ai_edit(text, instruction, api_key):
-    llm = get_llm(api_key)
+def apply_ai_edit(text, instruction, llm):
     prompt = (
-        "You are a precise document editor. Apply the user's instruction to the text below. "
-        "Return ONLY the complete edited text — no commentary, no preamble, no markdown code fences.\n\n"
-        f"INSTRUCTION:\n{instruction}\n\n"
-        f"CURRENT TEXT:\n{text}\n\n"
-        "EDITED TEXT:"
+        "You are editing a document. Apply the user's instruction and return the FULL updated "
+        "document text only - no commentary, no preamble, no markdown fences.\n\n"
+        f"INSTRUCTION:\n{instruction}\n\nCURRENT DOCUMENT:\n{text}"
     )
     return llm.invoke(prompt).content
 
 
-# =============================================================================
-#  REBUILD A PDF FROM EDITED TEXT
-# =============================================================================
-_FONT_NAME = None
-
-
-def _doc_font():
-    """Use a Unicode TTF if we can find one (better for accents / Arabic), else Helvetica."""
-    global _FONT_NAME
-    if _FONT_NAME:
-        return _FONT_NAME
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",   # Linux
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",                  # macOS
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",                     # Windows (has Arabic)
-        "C:\\Windows\\Fonts\\tahoma.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            try:
-                pdfmetrics.registerFont(TTFont("DocFont", p))
-                _FONT_NAME = "DocFont"
-                return _FONT_NAME
-            except Exception:
-                continue
-    _FONT_NAME = "Helvetica"
-    return _FONT_NAME
-
-
-def _has_arabic(s):
-    return any("\u0600" <= ch <= "\u06FF" for ch in s)
-
-
-def _shape(line):
-    if _ARABIC_OK and _has_arabic(line):
-        try:
-            return get_display(arabic_reshaper.reshape(line))
-        except Exception:
-            return line
-    return line
-
-
-def pages_to_pdf_bytes(pages):
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=LETTER,
-        topMargin=0.8 * inch, bottomMargin=0.8 * inch,
-        leftMargin=0.8 * inch, rightMargin=0.8 * inch,
-    )
-    font = _doc_font()
-    body = ParagraphStyle("Body", fontName=font, fontSize=11, leading=16)
-
-    flow = []
-    for pi, page in enumerate(pages):
-        lines = page.split("\n") if page else [""]
-        for line in lines:
-            if line.strip():
-                flow.append(Paragraph(escape(_shape(line)), body))
-            else:
-                flow.append(Spacer(1, 10))
-        if pi < len(pages) - 1:
-            flow.append(PageBreak())
-    if not flow:
-        flow.append(Paragraph("(empty document)", body))
-
-    doc.build(flow)
+def to_docx_bytes(text):
+    doc = DocxDocument()
+    for para in text.split("\n"):
+        doc.add_paragraph(para)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
     return buf.getvalue()
 
 
-# =============================================================================
-#  SESSION STATE
-# =============================================================================
-def _init_state():
-    defaults = {
-        "messages": [],
-        "chain": None,
-        "current_file": None,
-        "edited_pages": [],
-        "pdf_bytes": None,
-        "summary": "",
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+# ======================= SESSION STATE =======================
+for k, v in {"messages": [], "chain": None, "current_file": None,
+             "full_text": None, "edited_text": "", "summary": ""}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
-def _clear_page_keys():
-    for k in list(st.session_state.keys()):
-        if k.startswith("page_text_"):
-            del st.session_state[k]
+# ======================= PROCESS UPLOAD =======================
+if uploaded_file is not None:
+    if not key:
+        st.warning("Enter your Groq API key in the sidebar to continue.")
+    elif uploaded_file.name != st.session_state.current_file:
+        with st.spinner("Reading and indexing your PDF... (first run downloads a small model)"):
+            vs, full_text, n_pages, n_chunks = build_vectorstore(uploaded_file)
+            st.session_state.chain = build_chain(vs, key)
+            st.session_state.full_text = full_text
+            st.session_state.edited_text = full_text
+            st.session_state.current_file = uploaded_file.name
+            st.session_state.messages = []
+            st.session_state.summary = ""
+        st.sidebar.success(f"Indexed {n_pages} pages into {n_chunks} chunks.")
 
 
-_init_state()
+ready = st.session_state.full_text is not None
 
 
-# =============================================================================
-#  HANDLE A NEW UPLOAD
-# =============================================================================
-if uploaded_file is not None and uploaded_file.name != st.session_state.current_file:
-    with st.spinner("Reading and indexing your PDF... (first run downloads a small model)"):
-        file_bytes = uploaded_file.getvalue()
+# ======================= TABS =======================
+tab_chat, tab_sum, tab_edit = st.tabs(["Ask", "Summarize", "Edit & Export"])
 
-        # Editor text (works even without an API key)
-        st.session_state.edited_pages = extract_pages(file_bytes)
-
-        # Q&A index + chain (needs the key)
-        if groq_api_key:
-            vectorstore, n_pages, n_chunks = build_vectorstore(uploaded_file)
-            st.session_state.chain = build_chain(vectorstore, groq_api_key)
-            st.sidebar.success(f"✅ Indexed {n_pages} pages into {n_chunks} chunks.")
-        else:
-            st.session_state.chain = None
-            st.sidebar.info("PDF loaded for editing. Add a key to enable chat & summaries.")
-
-        st.session_state.current_file = uploaded_file.name
-        st.session_state.messages = []
-        st.session_state.summary = ""
-        st.session_state.pdf_bytes = None
-        _clear_page_keys()
-
-
-# =============================================================================
-#  MAIN TABS
-# =============================================================================
-tab_chat, tab_sum, tab_edit = st.tabs(["💬  Chat / Q&A", "📝  Summarize", "✏️  Edit PDF"])
-
-
-# ---------- TAB 1: CHAT ----------
+# ---------- TAB 1: ASK ----------
 with tab_chat:
-    if st.session_state.current_file is None:
-        st.info("👈 Upload a PDF in the sidebar to get started.")
-    elif st.session_state.chain is None:
-        st.warning("⬅️ Enter your Groq API key in the sidebar to enable chat.")
+    if not ready:
+        st.info("Enter your API key and upload a PDF to start.")
     else:
+        q = st.text_input("Ask a question about your PDF:", key="chat_q")
+        if st.button("Send", key="chat_send") and q.strip():
+            st.session_state.messages.append({"role": "user", "content": q})
+            with st.spinner("Thinking..."):
+                ans = st.session_state.chain.invoke(q)
+            st.session_state.messages.append({"role": "assistant", "content": ans})
         for m in st.session_state.messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        user_q = st.chat_input("Ask a question about your PDF...")
-        if user_q:
-            st.session_state.messages.append({"role": "user", "content": user_q})
-            with st.chat_message("user"):
-                st.markdown(user_q)
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    answer = st.session_state.chain.invoke(user_q)
-                st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-
-
 # ---------- TAB 2: SUMMARIZE ----------
 with tab_sum:
-    if st.session_state.current_file is None:
-        st.info("👈 Upload a PDF first.")
-    elif not groq_api_key:
-        st.warning("⬅️ A Groq API key is required to summarize.")
+    if not ready:
+        st.info("Upload a PDF first.")
     else:
-        c1, c2 = st.columns([2, 1])
-        with c2:
-            style = st.selectbox("Summary style", ["Short (TL;DR)", "Detailed", "Bullet points"])
-            if st.button("✨ Summarize", use_container_width=True):
-                full_text = "\n\n".join(st.session_state.edited_pages)
-                if not full_text.strip():
-                    st.error("No extractable text found in this PDF (it may be scanned images).")
-                else:
-                    with st.spinner("Summarizing..."):
-                        st.session_state.summary = summarize_text(full_text, style, groq_api_key)
-        with c1:
-            if st.session_state.summary:
-                st.markdown("#### Summary")
-                st.markdown(st.session_state.summary)
-                st.download_button(
-                    "⬇️ Download summary (.txt)",
-                    data=st.session_state.summary.encode("utf-8"),
-                    file_name="summary.txt",
-                    mime="text/plain",
-                )
-            else:
-                st.caption("Pick a style and press **Summarize**.")
+        if st.button("Summarize this PDF"):
+            with st.spinner("Reading the whole document and summarizing..."):
+                st.session_state.summary = summarize_text(st.session_state.full_text, make_llm(key))
+        if st.session_state.summary:
+            st.markdown(st.session_state.summary)
+            st.download_button("Download summary (.txt)",
+                               data=st.session_state.summary, file_name="summary.txt")
 
-
-# ---------- TAB 3: EDIT PDF ----------
+# ---------- TAB 3: EDIT & EXPORT ----------
 with tab_edit:
-    if st.session_state.current_file is None:
-        st.info("👈 Upload a PDF first.")
-    elif len(st.session_state.edited_pages) == 0:
-        st.error("No extractable text found (the PDF may be scanned images).")
+    if not ready:
+        st.info("Upload a PDF first.")
     else:
-        pages = st.session_state.edited_pages
-        st.caption(
-            "Edit the text directly, or use AI to apply changes. "
-            "Add or delete whole pages, then build & download the final PDF."
+        st.caption("Edit the text directly below, or tell the AI what to change. Then download the final file.")
+        edited = st.text_area("Document text:", value=st.session_state.edited_text, height=420)
+        st.session_state.edited_text = edited   # capture manual edits
+
+        instruction = st.text_input(
+            "Tell the AI what to change "
+            "(e.g. 'fix grammar', 'remove section 3', 'add a 30-day payment-terms clause'):"
         )
-
-        top = st.columns([3, 1, 1])
-        with top[0]:
-            idx = st.selectbox(
-                "Page to edit",
-                range(len(pages)),
-                format_func=lambda i: f"Page {i + 1} of {len(pages)}",
-            )
-        with top[1]:
-            if st.button("➕ Add page", use_container_width=True):
-                st.session_state.edited_pages.append("")
-                _clear_page_keys()
-                st.rerun()
-        with top[2]:
-            if st.button("🗑️ Delete page", use_container_width=True):
-                if len(st.session_state.edited_pages) > 1:
-                    st.session_state.edited_pages.pop(idx)
-                    _clear_page_keys()
-                    st.rerun()
-                else:
-                    st.warning("Can't delete the only page.")
-
-        # --- editable text area (state persists per page) ---
-        key = f"page_text_{idx}"
-        if key not in st.session_state:
-            st.session_state[key] = st.session_state.edited_pages[idx]
-
-        st.text_area("Page text", key=key, height=380)
-        st.session_state.edited_pages[idx] = st.session_state[key]
-
-        # --- AI-assisted edit ---
-        st.markdown("##### 🤖 Or tell the AI what to change on this page")
-        ai_cols = st.columns([4, 1])
-        with ai_cols[0]:
-            instruction = st.text_input(
-                "Instruction",
-                placeholder="e.g. 'Fix grammar and make it more formal' or 'Remove the second paragraph'",
-                label_visibility="collapsed",
-            )
-        with ai_cols[1]:
-            apply_ai = st.button("Apply AI edit", use_container_width=True)
-
-        if apply_ai:
-            if not groq_api_key:
-                st.warning("⬅️ A Groq API key is required for AI edits.")
-            elif not instruction.strip():
-                st.warning("Type an instruction first.")
-            else:
+        c1, c2 = st.columns(2)
+        if c1.button("Apply AI changes"):
+            if instruction.strip():
                 with st.spinner("Applying your changes..."):
-                    new_text = ai_edit(st.session_state[key], instruction, groq_api_key)
-                st.session_state[key] = new_text
-                st.session_state.edited_pages[idx] = new_text
-                st.rerun()
+                    st.session_state.edited_text = apply_ai_edit(
+                        st.session_state.edited_text, instruction, make_llm(key))
+                st.rerun()   # refresh the text box to show the AI's result
+            else:
+                st.warning("Type an instruction first.")
+        if c2.button("Reset to original"):
+            st.session_state.edited_text = st.session_state.full_text
+            st.rerun()
 
-        st.markdown("---")
-
-        # --- build & download ---
-        b1, b2 = st.columns([1, 1])
-        with b1:
-            if st.button("📄 Build final PDF", use_container_width=True):
-                with st.spinner("Rebuilding your PDF..."):
-                    st.session_state.pdf_bytes = pages_to_pdf_bytes(st.session_state.edited_pages)
-                st.success("Done! Download it on the right →")
-        with b2:
-            if st.session_state.pdf_bytes:
-                out_name = (st.session_state.current_file or "document").replace(".pdf", "") + "_edited.pdf"
-                st.download_button(
-                    "⬇️ Download edited PDF",
-                    data=st.session_state.pdf_bytes,
-                    file_name=out_name,
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+        st.markdown("##### Download the final file")
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "Word (.docx)", data=to_docx_bytes(st.session_state.edited_text),
+            file_name="edited_document.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        d2.download_button(
+            "Text (.txt)", data=st.session_state.edited_text, file_name="edited_document.txt",
+        )
