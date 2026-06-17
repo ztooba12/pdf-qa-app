@@ -6,7 +6,4 @@ langchain-huggingface
 sentence-transformers
 faiss-cpu
 pypdf
-reportlab
-arabic-reshaper
-python-bidi
-
+python-docx
